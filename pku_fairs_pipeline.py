@@ -173,13 +173,11 @@ class FeishuAPI:
         return body.get("data", {})
 
     def list_records(self, field_ids=None):
-        """分页拉取表内全部记录, 投影到指定字段。"""
+        """分页拉取表内全部记录。field_ids 当前未使用(Feishu OpenAPI 字段投影规则复杂, 全量拉数据更稳)。"""
         path = f"/open-apis/bitable/v1/apps/{self.base_token}/tables/{self.table_id}/records"
         records, page_token = [], None
         while True:
             params = {"page_size": 500, "automatic_fields": "false"}
-            if field_ids:
-                params["field_names"] = ",".join(field_ids)
             if page_token:
                 params["page_token"] = page_token
             data = self._request("GET", path, params=params)
