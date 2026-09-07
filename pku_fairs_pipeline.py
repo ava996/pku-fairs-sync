@@ -211,13 +211,25 @@ class FeishuAPI:
         return all_ids
 
     def batch_update(self, updates):
-        """updates: [(record_id, {field: value}), ...]  最多 1000/批。"""
-        path = f"/open-apis/bitable/v1/apps/{self.base_token}/tables/{self.table_id}/records/batch_update"
-        BATCH = 1000
-        for i in range(0, len(updates), BATCH):
-            chunk = updates[i:i + BATCH]
-            payload_records = [{"record_id": rid, "fields": fields} for rid, fields in chunk]
-            self._request("PUT", path, payload={"records": payload_records})
+        """updates: [(record_id, {field: value}), ...]  单条 update 循环 (批量接口不稳定)。
+        使用线程池并发以提升速度。"""
+        import concurrent.futures
+        path = lambda rid: f"/open-apis/bitable/v1/apps/{self.base_token}/tables/{self.table_id}/records/{rid}"
+        def _do(item):
+            rid, fields = item
+            try:
+                self._request("PUT", path(rid), payload={"fields": fields})
+                return None
+            except RuntimeError as e:
+                return f"{rid}: {e}"
+
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for err in ex.map(_do, updates):
+                if err:
+                    errors.append(err)
+        if errors:
+            raise RuntimeError(f"{len(errors)}/{len(updates)} 条更新失败:\n" + "\n".join(errors[:5]))
 
 
 # ============ 爬取 ============
@@ -311,16 +323,19 @@ def build_row(item, now):
             note = f"本场由{AGENCIES[org_name]}代理发布，标题无法解析公司名，公司名称显示为代理机构"
 
     level, reason = compute_recommendation(real_name, title)
+    # Feishu OpenAPI datetime 字段要求 Unix 毫秒时间戳(非字符串)
+    start_ms = int(start_dt.timestamp() * 1000) if start else None
+    end_ms = int(datetime.strptime(end, "%Y-%m-%d %H:%M:%S").timestamp() * 1000) if end else None
     return {
         "公司名称": real_name,
         "宣讲会标题": title,
         "举办时间": item.get("holdTimeExport", "") or "",
-        "开始时间": start or None,
-        "结束时间": end or None,
+        "开始时间": start_ms,
+        "结束时间": end_ms,
         "地点": item.get("fieldExport", "") or item.get("place", "") or "",
         "详情链接": f"[查看详情]({link})",
-        "时间范围": [compute_period(start_dt, now)],
-        "推荐等级": [level],
+        "时间范围": compute_period(start_dt, now),
+        "推荐等级": level,
         "推荐理由": reason,
         "备注": note,
         "宣讲会ID": item["id"],
@@ -366,15 +381,15 @@ def main():
 
     by_period, by_level = {}, {}
     for r in rows:
-        by_period[r["时间范围"][0]] = by_period.get(r["时间范围"][0], 0) + 1
-        by_level[r["推荐等级"][0]] = by_level.get(r["推荐等级"][0], 0) + 1
+        by_period[r["时间范围"]] = by_period.get(r["时间范围"], 0) + 1
+        by_level[r["推荐等级"]] = by_level.get(r["推荐等级"], 0) + 1
     print(f"[2/4] 时间范围分布: {by_period}")
     print(f"      推荐等级分布: {by_level}")
 
     if args.dry_run:
         print("[dry-run] 不写入飞书。前 5 行:")
         for r in rows[:5]:
-            print(f"      {r['开始时间']} | {r['公司名称']} | {r['地点']} | {r['推荐等级'][0]}")
+            print(f"      {r['开始时间']} | {r['公司名称']} | {r['地点']} | {r['推荐等级']}")
         return
 
     print(f"[3/4] 同步飞书多维表格...")
@@ -387,12 +402,14 @@ def main():
     stats = sync_to_feishu(rows, api)
     print(f"      新增 {stats['created']} 条, 更新 {stats['updated']} 条, 表内已有 {stats['total_existing']} 条")
 
-    focus = [r for r in rows if r["时间范围"][0] in ("当周", "下周") and r["推荐等级"][0] in ("🔥强烈推荐", "推荐")]
+    focus = [r for r in rows if r["时间范围"] in ("当周", "下周") and r["推荐等级"] in ("🔥强烈推荐", "推荐")]
     print("[4/4] 完成。")
     if focus:
         print(f"\n⭐ 当周/下周推荐场次 {len(focus)} 条:")
         for r in focus:
-            print(f"   {r['时间范围'][0]} | {r['开始时间']} | {r['公司名称']} | {r['推荐等级'][0]} | {r['推荐理由']}")
+            # ms -> 可读字符串
+            start_str = datetime.fromtimestamp(r["开始时间"] / 1000).strftime("%Y-%m-%d %H:%M") if r["开始时间"] else "?"
+            print(f"   {r['时间范围']} | {start_str} | {r['公司名称']} | {r['推荐等级']} | {r['推荐理由']}")
 
 
 if __name__ == "__main__":
