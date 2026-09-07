@@ -1,0 +1,49 @@
+name: 北大宣讲会周更
+
+on:
+  # 每周日 20:00 北京时间 (= 12:00 UTC)
+  schedule:
+    - cron: "0 12 * * 0"
+  # 允许手动触发(workflow_dispatch)便于测试
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "仅打印结果不写入飞书"
+        required: false
+        default: "false"
+
+jobs:
+  sync-fairs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 运行爬虫同步
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_BASE_TOKEN: ${{ secrets.FEISHU_BASE_TOKEN }}
+          FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
+          SINCE_DATE: ${{ vars.SINCE_DATE || '2026-09-01' }}
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            python3 pku_fairs_pipeline.py --dry-run
+          else
+            python3 pku_fairs_pipeline.py
+          fi
+
+      - name: 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-log-${{ github.run_id }}
+          path: latest_rows.json
+          if-no-files-found: ignore
+          retention-days: 30

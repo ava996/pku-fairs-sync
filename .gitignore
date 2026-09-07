@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+venv/
+
+# 运行时产物(可选保留 latest_rows.json)
+existing_records.ndjson
+verify*.ndjson
+verify*.manifest.json
+payload_*.json
