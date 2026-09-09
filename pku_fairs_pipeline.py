@@ -15,6 +15,10 @@
   FEISHU_TABLE_ID      目标 table_id
   SINCE_DATE           (可选) 过滤起始日期, 默认 2026-09-01
 
+权限要求 (飞书自建应用需开通):
+  base:record:read / base:record:write     记录读写(数据同步必需)
+  base:view:read / base:view:write_only    视图读写(自动按自然周建视图必需, 缺失时只警告不中断)
+
 用法:  python3 pku_fairs_pipeline.py [--dry-run]
 """
 
@@ -287,21 +291,16 @@ def compute_recommendation(real_name, title):
     return "一般", ""
 
 
-# ============ 时间范围 ============
-def week_bounds(now):
-    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    return monday, monday + timedelta(days=7), monday + timedelta(days=14)
+# ============ 时间范围(自然周标签) ============
+def week_label(dt):
+    """返回该日期所在自然周的标签, 形如 '9/14-9/20' (周一到周日)。
 
-
-def compute_period(start_dt, now):
-    mon1, mon2, mon3 = week_bounds(now)
-    if start_dt < now:
-        return "已结束"
-    if start_dt < mon2:
-        return "当周"
-    if start_dt < mon3:
-        return "下周"
-    return "未来"
+    取代旧的「当周/下周/未来/已结束」四段式, 改为按自然周(周一起始)标注,
+    每一场宣讲会都归入其举办日期所在的那个自然周。
+    """
+    monday = dt - timedelta(days=dt.weekday())
+    sunday = monday + timedelta(days=6)
+    return f"{monday.month}/{monday.day}-{sunday.month}/{sunday.day}"
 
 
 # ============ 行构造 ============
@@ -334,7 +333,7 @@ def build_row(item, now):
         "结束时间": end_ms,
         "地点": item.get("fieldExport", "") or item.get("place", "") or "",
         "详情链接": f"[查看详情]({link})",
-        "时间范围": compute_period(start_dt, now),
+        "时间范围": week_label(start_dt),
         "推荐等级": level,
         "推荐理由": reason,
         "备注": note,
@@ -366,6 +365,85 @@ def sync_to_feishu(rows, api):
     if to_update:
         api.batch_update(to_update)
     return {"created": len(created_ids), "updated": len(to_update), "total_existing": len(by_id)}
+
+
+# ============ 自然周视图管理 ============
+# 为每一个自然周标签自动维护一张视图, 视图按「时间范围 = 该周」筛选、按「开始时间」升序排序。
+# 视图操作走 base/v3 OpenAPI, 需要应用具备 base:view:read / base:view:write_only 权限。
+# 若权限缺失, 这里只打印警告、绝不中断流水线(数据同步仍然成功)。
+def _vid(v):
+    """兼容 base/v3 与 bitable/v1 两种字段命名。"""
+    return (v or {}).get("view_id") or (v or {}).get("id") or ""
+
+
+def _vname(v):
+    return (v or {}).get("view_name") or (v or {}).get("name") or ""
+
+
+def list_views(api):
+    """返回 {视图名: view_id}。"""
+    path = f"/open-apis/base/v3/bases/{api.base_token}/tables/{api.table_id}/views"
+    data = api._request("GET", path)
+    views = data.get("views") or data.get("items") or []
+    return {_vname(v): _vid(v) for v in views if _vname(v) and _vid(v)}
+
+
+def create_view(api, name):
+    path = f"/open-apis/base/v3/bases/{api.base_token}/tables/{api.table_id}/views"
+    data = api._request("POST", path, payload={"name": name, "type": "grid"})
+    # 兼容多种响应结构: data.view 对象 / data.views 数组 / data 本身即视图
+    if isinstance(data.get("view"), dict) and _vid(data["view"]):
+        return _vid(data["view"])
+    if isinstance(data.get("views"), list) and data["views"] and _vid(data["views"][0]):
+        return _vid(data["views"][0])
+    return _vid(data)
+
+
+def set_view_filter(api, view_id, week):
+    """视图筛选: 时间范围 == 指定自然周(单选, 用 intersects + 选项名数组)。"""
+    path = f"/open-apis/base/v3/bases/{api.base_token}/tables/{api.table_id}/views/{view_id}/filter"
+    api._request("PUT", path, payload={
+        "logic": "and",
+        "conditions": [["时间范围", "intersects", [week]]],
+    })
+
+
+def set_view_sort(api, view_id):
+    path = f"/open-apis/base/v3/bases/{api.base_token}/tables/{api.table_id}/views/{view_id}/sort"
+    api._request("PUT", path, payload={"sort_config": [{"field": "开始时间", "desc": False}]})
+
+
+def ensure_week_views(api, week_labels):
+    """确保每个自然周都有一张同名视图, 并配置好筛选/排序。
+
+    week_labels: 去重后的自然周标签集合(如 {'9/14-9/20', '9/21-9/27'})。
+    「是否参加」是表级字段, 新视图默认继承全部字段, 因此自动带入每张周视图。
+    """
+    try:
+        existing = list_views(api)
+    except RuntimeError as e:
+        print(f"      ⚠️ 读取视图列表失败(缺少 base:view:read 权限?): {e}")
+        return
+    created = 0
+    for week in sorted(week_labels):
+        name = f"📅 {week}"
+        view_id = existing.get(name)
+        if not view_id:
+            try:
+                view_id = create_view(api, name)
+                if not view_id:
+                    raise RuntimeError("创建视图返回的 view_id 为空")
+                created += 1
+                print(f"      + 新建视图: {name}")
+            except RuntimeError as e:
+                print(f"      ⚠️ 新建视图 {name} 失败(缺少 base:view:write_only 权限?): {e}")
+                continue
+        try:
+            set_view_filter(api, view_id, week)
+            set_view_sort(api, view_id)
+        except RuntimeError as e:
+            print(f"      ⚠️ 配置视图 {name} 筛选/排序失败: {e}")
+    print(f"      周视图就绪: 新建 {created} 张, 覆盖 {len(week_labels)} 个自然周")
 
 
 # ============ 主流程 ============
@@ -406,12 +484,17 @@ def main():
     stats = sync_to_feishu(rows, api)
     print(f"      新增 {stats['created']} 条, 更新 {stats['updated']} 条, 表内已有 {stats['total_existing']} 条")
 
-    focus = [r for r in rows if r["时间范围"] in ("当周", "下周") and r["推荐等级"] in ("🔥强烈推荐", "推荐")]
-    print("[4/4] 完成。")
+    week_labels = sorted({r["时间范围"] for r in rows})
+    print(f"[4/4] 自然周视图管理 ({len(week_labels)} 个自然周: {', '.join(week_labels)})...")
+    ensure_week_views(api, week_labels)
+
+    # 本周与下周推荐场次(基于自然周标签)
+    this_label = week_label(now)
+    next_label = week_label(now + timedelta(days=7))
+    focus = [r for r in rows if r["时间范围"] in (this_label, next_label) and r["推荐等级"] in ("🔥强烈推荐", "推荐")]
     if focus:
-        print(f"\n⭐ 当周/下周推荐场次 {len(focus)} 条:")
+        print(f"\n⭐ 本周/下周({this_label} / {next_label})推荐场次 {len(focus)} 条:")
         for r in focus:
-            # ms -> 可读字符串
             start_str = datetime.fromtimestamp(r["开始时间"] / 1000).strftime("%Y-%m-%d %H:%M") if r["开始时间"] else "?"
             print(f"   {r['时间范围']} | {start_str} | {r['公司名称']} | {r['推荐等级']} | {r['推荐理由']}")
 
