@@ -343,8 +343,12 @@ def build_row(item, now):
 
 
 # ============ 同步 ============
+# ⚠️ 重要设计约束：部分更新机制
+# 脚本更新记录时只提交 build_row() 返回的字段（公司名称/时间/地点/推荐等）。
+# 「参加状态」等用户手动维护的字段不在 build_row 中，因此永不被脚本覆盖。
+# 若未来新增用户手动字段，同样不要加进 build_row，否则每周更新会清掉用户标记。
 def sync_to_feishu(rows, api):
-    """对比已有记录: 新增缺失的, 更新已有的。"""
+    """对比已有记录: 新增缺失的, 更新已有的(部分更新, 不触碰手动标记字段)。"""
     existing = api.list_records(field_ids=["宣讲会ID"])
     by_id = {}
     for rec in existing:
