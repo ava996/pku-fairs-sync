@@ -371,6 +371,13 @@ def sync_to_feishu(rows, api):
 # 为每一个自然周标签自动维护一张视图, 视图按「时间范围 = 该周」筛选、按「开始时间」升序排序。
 # 视图操作走 base/v3 OpenAPI, 需要应用具备 base:view:read / base:view:write_only 权限。
 # 若权限缺失, 这里只打印警告、绝不中断流水线(数据同步仍然成功)。
+# 视图字段显示顺序(与飞书 UI 手动调整一致: 参加状态紧跟举办时间)。
+FIELD_ORDER = [
+    "公司名称", "宣讲会标题", "举办时间", "参加状态", "开始时间", "结束时间",
+    "地点", "详情链接", "时间范围", "推荐等级", "推荐理由", "宣讲会ID", "备注",
+]
+
+
 def _vid(v):
     """兼容 base/v3 与 bitable/v1 两种字段命名。"""
     return (v or {}).get("view_id") or (v or {}).get("id") or ""
@@ -413,11 +420,16 @@ def set_view_sort(api, view_id):
     api._request("PUT", path, payload={"sort_config": [{"field": "开始时间", "desc": False}]})
 
 
+def set_view_visible_fields(api, view_id):
+    """设置视图字段显示顺序(参加状态紧跟举办时间), 同时控制可见字段。"""
+    path = f"/open-apis/base/v3/bases/{api.base_token}/tables/{api.table_id}/views/{view_id}/visible_fields"
+    api._request("PUT", path, payload={"visible_fields": FIELD_ORDER})
+
+
 def ensure_week_views(api, week_labels):
-    """确保每个自然周都有一张同名视图, 并配置好筛选/排序。
+    """确保每个自然周都有一张同名视图, 并配置好筛选/排序/字段顺序。
 
     week_labels: 去重后的自然周标签集合(如 {'9/14-9/20', '9/21-9/27'})。
-    「是否参加」是表级字段, 新视图默认继承全部字段, 因此自动带入每张周视图。
     """
     try:
         existing = list_views(api)
@@ -441,6 +453,7 @@ def ensure_week_views(api, week_labels):
         try:
             set_view_filter(api, view_id, week)
             set_view_sort(api, view_id)
+            set_view_visible_fields(api, view_id)
         except RuntimeError as e:
             print(f"      ⚠️ 配置视图 {name} 筛选/排序失败: {e}")
     print(f"      周视图就绪: 新建 {created} 张, 覆盖 {len(week_labels)} 个自然周")
